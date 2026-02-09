@@ -1,0 +1,20 @@
+{
+  "TATAMOTORS": {
+    "close_eq": [
+      "TVSMOTOR",
+      "TATAPOWER",
+      "MOTOUR",
+      "TATACONSUM",
+      "SHARDAMOTR",
+      "DATAMATICS"
+    ],
+    "close_nse_any": [
+      "TVSMOTOR",
+      "TATAPOWER",
+      "MOTOUR",
+      "TATACONSUM",
+      "SHARDAMOTR",
+      "DATAMATICS"
+    ]
+  }
+}

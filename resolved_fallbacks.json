@@ -1,0 +1,38 @@
+{
+  "BESTAGRO": {
+    "resolved_to": "BESTAGRO-BE",
+    "mode": "EQ_SUFFIX"
+  },
+  "KAPSTON": {
+    "resolved_to": "KAPSTON-BE",
+    "mode": "EQ_SUFFIX"
+  },
+  "ARVEE": {
+    "resolved_to": "ARVEE-BE",
+    "mode": "EQ_SUFFIX"
+  },
+  "RAJESHEXPO": {
+    "resolved_to": "RAJESHEXPO-BZ",
+    "mode": "EQ_SUFFIX"
+  },
+  "MAANALU": {
+    "resolved_to": "MAANALU-BE",
+    "mode": "EQ_SUFFIX"
+  },
+  "AGRITECH": {
+    "resolved_to": "AGRITECH-BE",
+    "mode": "EQ_SUFFIX"
+  },
+  "AVROIND": {
+    "resolved_to": "AVROIND-BE",
+    "mode": "EQ_SUFFIX"
+  },
+  "AUSOMENT": {
+    "resolved_to": "AUSOMENT-BE",
+    "mode": "EQ_SUFFIX"
+  },
+  "EMBDL": {
+    "resolved_to": "EMBDL-BE",
+    "mode": "EQ_SUFFIX"
+  }
+}
