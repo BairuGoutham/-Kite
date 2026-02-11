@@ -37,6 +37,11 @@ BREAKOUT_VALUE_MIN = 1.5e7
 MIN_ENTRY_PRICE = 100.0
 MAX_ENTRY_PRICE = 5000.0
 
+# ✅ NEW: hard rupee exits (per trade) and tick size
+HARD_MAX_LOSS_RUPEES = 50.0
+HARD_MAX_PROFIT_RUPEES = 150.0
+PRICE_TICK_SIZE = 0.05
+
 # Redis keys
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
@@ -57,6 +62,10 @@ def k_sl(sym): return f"sl:{sym}"
 def k_target(sym): return f"target:{sym}"
 def k_qty(sym): return f"qty:{sym}"
 def k_override(sym): return f"override:{sym}"  # {"sl":..., "target":...}
+
+# ✅ NEW: exit order ids (SL-M + Target LIMIT)
+def k_sl_oid(sym): return f"sl_order_id:{sym}"
+def k_tgt_oid(sym): return f"tgt_order_id:{sym}"
 
 
 # =========================
@@ -259,6 +268,38 @@ def worker_main(worker_id: int, q: mp.Queue):
         if at:
             kite_local.set_access_token(at)
 
+    # ✅ NEW: helpers for hard rupee exits via SL-M + target LIMIT
+    def round_to_tick(price: float, tick: float = PRICE_TICK_SIZE) -> float:
+        try:
+            return round(round(float(price) / float(tick)) * float(tick), 2)
+        except Exception:
+            return float(price)
+
+    def wait_for_complete_and_avg(order_id: str, timeout_s: int = 10):
+        """
+        Poll order history until COMPLETE or timeout.
+        Returns (is_complete: bool, avg_price: float)
+        """
+        t0 = time.time()
+        last_avg = 0.0
+        while time.time() - t0 < timeout_s:
+            try:
+                hist = kite_local.order_history(order_id)
+                if hist:
+                    last = hist[-1]
+                    status = str(last.get("status", "")).upper()
+                    avg = float(last.get("average_price") or 0.0)
+                    if avg > 0:
+                        last_avg = avg
+                    if status == "COMPLETE":
+                        return True, float(avg or last_avg or 0.0)
+                    if status in ("REJECTED", "CANCELLED"):
+                        return False, 0.0
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return False, 0.0
+
     refresh_token()
     print(f"[WORKER {worker_id}] started")
 
@@ -266,28 +307,43 @@ def worker_main(worker_id: int, q: mp.Queue):
     mem = {}
     pending_next_open = {}
 
-    # ✅ NEW (minimal): use ONLY today's high-so-far from Kite REST (prevents false breakouts if WS misses spikes)
-    _today_high_cache = {}
-    _today_high_cache_ts = {}
-    _TODAY_HIGH_CACHE_TTL_S = 20
+    # ==========================================================
+    # ✅ REST-ONLY OPENING CANDLES (NO FALLBACK)
+    # ==========================================================
+    _rest_c915 = {}  # sym -> candle dict
+    _rest_c916 = {}  # sym -> candle dict
 
-    def get_today_high_so_far(symbol: str):
+    def _extract_minute_candle(data, hh: int, mm: int):
+        found = None
+        for c in data or []:
+            dt = c.get("date")
+            if dt is None:
+                continue
+            if isinstance(dt, str):
+                try:
+                    dt = datetime.datetime.fromisoformat(dt)
+                except Exception:
+                    continue
+            tt = dt.time()
+            if tt.hour == hh and tt.minute == mm:
+                found = c
+        return found
+
+    def fetch_single_candle(sym: str, hh: int, mm: int, window_end: datetime.time):
+        """
+        Fetch ONLY one target minute candle (hh:mm) using a tiny historical window.
+        Returns: candle dict or None
+        """
         try:
-            now = int(time.time())
-            last = int(_today_high_cache_ts.get(symbol, 0) or 0)
-            if last and (now - last) <= _TODAY_HIGH_CACHE_TTL_S:
-                return _today_high_cache.get(symbol)
-
-            tok = allowed_stocks.get(symbol)
+            tok = allowed_stocks.get(sym)
             if not tok:
                 return None
 
             today = datetime.date.today()
 
-            # ✅ FIX (minimal): ensure 09:15 candle is ALWAYS included (boundary-safe)
-            start_dt = datetime.datetime.combine(today, datetime.time(9, 14, 0))  # buffer before 09:15
-            end_dt = datetime.datetime.now() + datetime.timedelta(minutes=1)       # buffer after "now"
-            cutoff_dt = datetime.datetime.combine(today, datetime.time(9, 15, 0))  # ignore 09:14 buffer candle
+            # buffer start 1 minute before target
+            start_dt = datetime.datetime.combine(today, datetime.time(hh, max(mm - 1, 0), 0))
+            end_dt = datetime.datetime.combine(today, window_end)
 
             data = kite_local.historical_data(
                 instrument_token=int(tok),
@@ -295,34 +351,155 @@ def worker_main(worker_id: int, q: mp.Queue):
                 to_date=end_dt,
                 interval="minute"
             )
-            if not data:
+            c = _extract_minute_candle(data, hh, mm)
+            if not c:
                 return None
 
-            highs = []
-            for c in data:
-                dt = c.get("date")
-                if dt is None:
-                    continue
-                if isinstance(dt, str):
-                    try:
-                        dt = datetime.datetime.fromisoformat(dt)
-                    except Exception:
-                        continue
-                if isinstance(dt, datetime.datetime) and dt >= cutoff_dt:
-                    highs.append(float(c.get("high") or 0.0))
-
-            if not highs:
-                return None
-
-            hi = max(highs)
-            if hi <= 0:
-                return None
-
-            _today_high_cache[symbol] = hi
-            _today_high_cache_ts[symbol] = now
-            return hi
+            return {
+                "open": float(c["open"]),
+                "high": float(c["high"]),
+                "low": float(c["low"]),
+                "close": float(c["close"]),
+            }
         except Exception:
             return None
+
+    def try_lock_opening_from_rest(sym: str, ts: datetime.datetime, m: dict):
+        """
+        Called on every tick. Will:
+          - fetch 09:15 after 09:16 begins (single attempt)
+          - fetch 09:16 after 09:17 begins (single attempt)
+          - when both present, lock pattern
+          - if missing after attempts -> ignore symbol (REST-only)
+        """
+        if m.get("open_locked") or m.get("ignored"):
+            return
+
+        now_epoch = time.time()
+
+        # throttle (prevents hammering REST)
+        next_try = float(m.get("_rest_next_try", 0.0) or 0.0)
+        if now_epoch < next_try:
+            return
+
+        # ✅ max attempts (CHANGED TO 1)
+        a1 = int(m.get("_rest_a915", 0) or 0)
+        a2 = int(m.get("_rest_a916", 0) or 0)
+        MAX_ATTEMPTS_EACH = 1  # ✅ CHANGED FROM 2 -> 1
+
+        # 1) After 09:16 starts, fetch 09:15 candle if not cached
+        if (ts.hour == 9 and ts.minute >= 16) and (sym not in _rest_c915) and a1 < MAX_ATTEMPTS_EACH:
+            m["_rest_a915"] = a1 + 1
+            c = fetch_single_candle(sym, 9, 15, window_end=datetime.time(9, 16, 30))
+            if c:
+                _rest_c915[sym] = c
+            else:
+                # keep throttle but we won't retry due to MAX_ATTEMPTS_EACH=1
+                m["_rest_next_try"] = now_epoch + 0.7
+                return
+
+        # 2) After 09:17 starts, fetch 09:16 candle if not cached
+        if (ts.hour == 9 and ts.minute >= 17) and (sym not in _rest_c916) and a2 < MAX_ATTEMPTS_EACH:
+            m["_rest_a916"] = a2 + 1
+            c = fetch_single_candle(sym, 9, 16, window_end=datetime.time(9, 17, 30))
+            if c:
+                _rest_c916[sym] = c
+            else:
+                m["_rest_next_try"] = now_epoch + 0.7
+                return
+
+        # 3) If both are available -> lock
+        c915 = _rest_c915.get(sym)
+        c916 = _rest_c916.get(sym)
+        if c915 and c916:
+            o1, h1, l1, cl1 = c915["open"], c915["high"], c915["low"], c915["close"]
+            o2, h2, l2, cl2 = c916["open"], c916["high"], c916["low"], c916["close"]
+
+            red1 = (cl1 < o1)
+            red2 = (cl2 < o2)
+
+            ignored = (not red1) or (not red2) or (h2 >= h1)
+            pattern_ok = (not ignored)
+            day_high = max(h1, h2)
+
+            m["open_locked"] = True
+            m["ignored"] = bool(ignored)
+            m["c1"] = {"high": float(h1), "low": float(l1)}
+            m["c2"] = {"high": float(h2), "low": float(l2)}
+            m["pattern_ok"] = bool(pattern_ok)
+            m["day_high"] = float(day_high)
+            return
+
+        # 4) If reached attempts and still missing -> ignore (after 09:17)
+        if ts.hour == 9 and ts.minute >= 17:
+            if (sym not in _rest_c915 and int(m.get("_rest_a915", 0) or 0) >= MAX_ATTEMPTS_EACH) or \
+               (sym not in _rest_c916 and int(m.get("_rest_a916", 0) or 0) >= MAX_ATTEMPTS_EACH):
+                m["ignored"] = True
+                return
+
+    # ✅ NEW: monitor exit orders (OCO via cancel-other) without manual involvement
+    def monitor_exit_orders():
+        while True:
+            try:
+                refresh_token()
+                if not redis_ok_local():
+                    time.sleep(1)
+                    continue
+
+                # check only symbols that worker has seen (mem keys)
+                for sym in list(mem.keys()):
+                    if not r_local.get(k_in_trade(sym)):
+                        continue
+
+                    sl_oid = (r_local.get(k_sl_oid(sym)) or "").strip()
+                    tgt_oid = (r_local.get(k_tgt_oid(sym)) or "").strip()
+                    if not sl_oid or not tgt_oid:
+                        continue
+
+                    def status_of(oid: str) -> str:
+                        try:
+                            h = kite_local.order_history(oid)
+                            if not h:
+                                return ""
+                            return str(h[-1].get("status", "")).upper()
+                        except Exception:
+                            return ""
+
+                    sl_st = status_of(sl_oid)
+                    tg_st = status_of(tgt_oid)
+
+                    # If one is COMPLETE -> cancel the other
+                    if sl_st == "COMPLETE" and tg_st not in ("CANCELLED", "REJECTED", "COMPLETE"):
+                        try:
+                            kite_local.cancel_order(variety=kite_local.VARIETY_REGULAR, order_id=tgt_oid)
+                            print(f"{sym} SL hit -> cancelled target {tgt_oid}")
+                        except Exception as e:
+                            print(f"{sym} cancel target failed: {e}")
+
+                    if tg_st == "COMPLETE" and sl_st not in ("CANCELLED", "REJECTED", "COMPLETE"):
+                        try:
+                            kite_local.cancel_order(variety=kite_local.VARIETY_REGULAR, order_id=sl_oid)
+                            print(f"{sym} TARGET hit -> cancelled SL {sl_oid}")
+                        except Exception as e:
+                            print(f"{sym} cancel SL failed: {e}")
+
+                    # If either complete, clear redis tracking for this symbol
+                    if sl_st == "COMPLETE" or tg_st == "COMPLETE":
+                        r_local.delete(k_in_trade(sym))
+                        r_local.delete(k_entry(sym))
+                        r_local.delete(k_sl(sym))
+                        r_local.delete(k_target(sym))
+                        r_local.delete(k_qty(sym))
+                        r_local.delete(k_override(sym))
+                        r_local.delete(k_sl_oid(sym))
+                        r_local.delete(k_tgt_oid(sym))
+
+            except Exception as e:
+                print(f"[WORKER {worker_id}] monitor_exit_orders error: {e}")
+
+            time.sleep(1)
+
+    threading.Thread(target=monitor_exit_orders, daemon=True).start()
 
     while True:
         tick = q.get()
@@ -348,6 +525,12 @@ def worker_main(worker_id: int, q: mp.Queue):
                     "c2": None,
                     "pattern_ok": False,
                     "day_high": None,
+                    "open_locked": False,
+
+                    # REST fetch controls
+                    "_rest_a915": 0,
+                    "_rest_a916": 0,
+                    "_rest_next_try": 0.0,
                 }
 
             m = mem[sym]
@@ -362,6 +545,11 @@ def worker_main(worker_id: int, q: mp.Queue):
                 ts = datetime.datetime.now()
             elif isinstance(ts, str):
                 ts = datetime.datetime.fromisoformat(ts)
+
+            # ✅ REST-only: stage fetch 09:15 after 09:16 starts, 09:16 after 09:17 starts
+            try_lock_opening_from_rest(sym, ts, m)
+            if m["ignored"]:
+                continue
 
             minute_bucket = ts.replace(second=0, microsecond=0)
             cur = candle_1m.get(sym)
@@ -399,13 +587,10 @@ def worker_main(worker_id: int, q: mp.Queue):
                     pending_next_open.pop(sym, None)
                     return
 
-                # =========================
-                # ✅ ONLY CHANGE YOU ASKED FOR:
                 # SL = closer to entry among:
                 #   1) Low of breakout candle (pe["sl"])
                 #   2) 0.9% below entry (entry * 0.991)
                 # For BUY, "closer" => higher SL => max()
-                # =========================
                 sl_breakout = float(pe["sl"])
                 sl_09 = float(entry) * (1.0 - 0.009)
                 sl = max(sl_breakout, sl_09)
@@ -423,7 +608,8 @@ def worker_main(worker_id: int, q: mp.Queue):
                 target = entry + 3.0 * (entry - sl)
 
                 try:
-                    kite_local.place_order(
+                    # ✅ BUY first (market)
+                    buy_oid = kite_local.place_order(
                         variety=kite_local.VARIETY_REGULAR,
                         exchange=kite_local.EXCHANGE_NSE,
                         tradingsymbol=sym,
@@ -433,15 +619,61 @@ def worker_main(worker_id: int, q: mp.Queue):
                         order_type=kite_local.ORDER_TYPE_MARKET,
                     )
 
+                    # ✅ wait for actual average fill
+                    filled, avg_fill = wait_for_complete_and_avg(buy_oid, timeout_s=10)
+                    if not filled or avg_fill <= 0:
+                        pending_next_open.pop(sym, None)
+                        print(f"{sym} BUY NOT COMPLETE / FAILED oid={buy_oid}")
+                        return
+
+                    # ✅ compute HARD ₹ SL/Target prices from avg fill + qty
+                    sl_trigger = float(avg_fill) - (float(HARD_MAX_LOSS_RUPEES) / float(qty))
+                    tgt_price = float(avg_fill) + (float(HARD_MAX_PROFIT_RUPEES) / float(qty))
+
+                    sl_trigger = round_to_tick(sl_trigger)
+                    tgt_price = round_to_tick(tgt_price)
+
+                    if sl_trigger <= 0 or tgt_price <= 0:
+                        pending_next_open.pop(sym, None)
+                        print(f"{sym} BAD SL/TGT computed avg={avg_fill} qty={qty}")
+                        return
+
+                    # ✅ place SL-M (trigger only)
+                    sl_oid = kite_local.place_order(
+                        variety=kite_local.VARIETY_REGULAR,
+                        exchange=kite_local.EXCHANGE_NSE,
+                        tradingsymbol=sym,
+                        transaction_type=kite_local.TRANSACTION_TYPE_SELL,
+                        quantity=int(qty),
+                        product=kite_local.PRODUCT_MIS,
+                        order_type=kite_local.ORDER_TYPE_SLM,
+                        trigger_price=float(sl_trigger),
+                    )
+
+                    # ✅ place Target LIMIT
+                    tgt_oid = kite_local.place_order(
+                        variety=kite_local.VARIETY_REGULAR,
+                        exchange=kite_local.EXCHANGE_NSE,
+                        tradingsymbol=sym,
+                        transaction_type=kite_local.TRANSACTION_TYPE_SELL,
+                        quantity=int(qty),
+                        product=kite_local.PRODUCT_MIS,
+                        order_type=kite_local.ORDER_TYPE_LIMIT,
+                        price=float(tgt_price),
+                    )
+
+                    # ✅ store tracking (entry stored as avg fill for correct ₹ exits)
                     r_local.set(k_in_trade(sym), "BUY")
-                    r_local.set(k_entry(sym), str(entry))
-                    r_local.set(k_sl(sym), str(sl))
-                    r_local.set(k_target(sym), str(target))
+                    r_local.set(k_entry(sym), str(avg_fill))
+                    r_local.set(k_sl(sym), str(sl_trigger))
+                    r_local.set(k_target(sym), str(tgt_price))
                     r_local.set(k_qty(sym), str(int(qty)))
+                    r_local.set(k_sl_oid(sym), str(sl_oid))
+                    r_local.set(k_tgt_oid(sym), str(tgt_oid))
                     r_local.incr(TRADES_DONE_KEY)
 
                     pending_next_open.pop(sym, None)
-                    print(f"{sym} ENTRY @ {entry:.2f} qty={qty} SL={sl:.2f} TGT={target:.2f}")
+                    print(f"{sym} ENTRY avg={avg_fill:.2f} qty={qty} SLTrig={sl_trigger:.2f} TGT={tgt_price:.2f}")
 
                 except Exception as e:
                     pending_next_open.pop(sym, None)
@@ -480,53 +712,40 @@ def worker_main(worker_id: int, q: mp.Queue):
             }
 
             c_ts = candle["ts"]
-            c_open = candle["open"]
             c_high = candle["high"]
             c_low = candle["low"]
             c_close = candle["close"]
 
-            if m["c1"] is None:
-                if first_candle_ts_ok(c_ts):
-                    if not is_red(c_open, c_close):
-                        m["ignored"] = True
-                    else:
-                        m["c1"] = {"high": c_high, "low": c_low}
-                        m["day_high"] = c_high
+            # ✅ REST-only rule: do NOTHING until open_locked is True
+            if not m.get("open_locked"):
+                candle_1m[sym] = {
+                    "minute": minute_bucket,
+                    "open": price,
+                    "high": price,
+                    "low": price,
+                    "close": price,
+                    "vol_today_start": vol_today,
+                    "vol_today_end": vol_today,
+                }
+                maybe_entry_on_open(minute_bucket, price)
+                continue
 
-            elif m["c2"] is None:
-                if second_candle_ts_ok(c_ts):
-                    if not is_red(c_open, c_close):
-                        m["ignored"] = True
-                    else:
-                        c1h = float(m["c1"]["high"])
-                        if c1h <= c_high:
-                            m["ignored"] = True
-                        else:
-                            m["c2"] = {"high": c_high, "low": c_low}
-                            m["pattern_ok"] = True
+            # ✅ from here onward: opening candles are REST-locked
+            prev_day_high = float(m["day_high"] or c_high)
+            m["day_high"] = max(prev_day_high, c_high)
 
-                    m["day_high"] = max(float(m["day_high"] or c_high), c_high)
+            if within_new_trade_window(c_ts):
+                if m["pattern_ok"] and (not r_local.get(k_in_trade(sym))) and (sym not in pending_next_open):
+                    if c_high > prev_day_high:
+                        ok, _val = breakout_value_ok(c_close, candle["vol_1m"])
+                        if ok:
+                            entry_minute = minute_bucket
+                            sl = float(c_low)
 
-            else:
-                # ✅ CHANGED MINIMALLY: compare breakout against today's TRUE high-so-far (NOT yesterday)
-                true_day_high = get_today_high_so_far(sym)
-                prev_day_high = float(true_day_high if true_day_high is not None else (m["day_high"] or c_high))
-                m["day_high"] = max(prev_day_high, c_high)
-
-                if within_new_trade_window(c_ts):
-                    if m["pattern_ok"] and (not r_local.get(k_in_trade(sym))) and (sym not in pending_next_open):
-                        if c_high > prev_day_high:
-                            ok, _val = breakout_value_ok(c_close, candle["vol_1m"])
-                            if ok:
-                                entry_minute = minute_bucket
-                                sl = float(c_low)
-
-                                # ✅ FIX: Do NOT calculate target using c_close here.
-                                # target is calculated at actual entry time (open_price) in maybe_entry_on_open()
-                                pending_next_open[sym] = {
-                                    "next_minute": entry_minute,
-                                    "sl": sl,
-                                }
+                            pending_next_open[sym] = {
+                                "next_minute": entry_minute,
+                                "sl": sl,
+                            }
 
             candle_1m[sym] = {
                 "minute": minute_bucket,
@@ -538,72 +757,6 @@ def worker_main(worker_id: int, q: mp.Queue):
                 "vol_today_end": vol_today,
             }
             maybe_entry_on_open(minute_bucket, price)
-
-            if r_local.get(k_in_trade(sym)):
-                entry = float(r_local.get(k_entry(sym)) or 0.0)
-                sl = float(r_local.get(k_sl(sym)) or 0.0)
-                target = float(r_local.get(k_target(sym)) or 0.0)
-                qty = int(r_local.get(k_qty(sym)) or 0)
-
-                raw_ov = r_local.get(k_override(sym))
-                if raw_ov:
-                    try:
-                        ov = json.loads(raw_ov)
-                        if ov.get("sl") is not None:
-                            sl = float(ov["sl"])
-                            r_local.set(k_sl(sym), str(sl))
-                        if ov.get("target") is not None:
-                            target = float(ov["target"])
-                            r_local.set(k_target(sym), str(target))
-                    except Exception:
-                        pass
-
-                if qty > 0 and entry > 0 and sl > 0 and target > 0:
-                    if price <= sl:
-                        # ✅ FIX: delete tracking keys ONLY if SELL succeeds
-                        try:
-                            kite_local.place_order(
-                                variety=kite_local.VARIETY_REGULAR,
-                                exchange=kite_local.EXCHANGE_NSE,
-                                tradingsymbol=sym,
-                                transaction_type=kite_local.TRANSACTION_TYPE_SELL,
-                                quantity=int(qty),
-                                product=kite_local.PRODUCT_MIS,
-                                order_type=kite_local.ORDER_TYPE_MARKET,
-                            )
-                        except Exception as e:
-                            print(f"{sym} EXIT SL FAILED: {e}")
-                        else:
-                            r_local.delete(k_in_trade(sym))
-                            r_local.delete(k_entry(sym))
-                            r_local.delete(k_sl(sym))
-                            r_local.delete(k_target(sym))
-                            r_local.delete(k_qty(sym))
-                            r_local.delete(k_override(sym))
-                            print(f"{sym} EXIT SL @ {price:.2f}")
-
-                    elif price >= target:
-                        # ✅ FIX: delete tracking keys ONLY if SELL succeeds
-                        try:
-                            kite_local.place_order(
-                                variety=kite_local.VARIETY_REGULAR,
-                                exchange=kite_local.EXCHANGE_NSE,
-                                tradingsymbol=sym,
-                                transaction_type=kite_local.TRANSACTION_TYPE_SELL,
-                                quantity=int(qty),
-                                product=kite_local.PRODUCT_MIS,
-                                order_type=kite_local.ORDER_TYPE_MARKET,
-                            )
-                        except Exception as e:
-                            print(f"{sym} EXIT TARGET FAILED: {e}")
-                        else:
-                            r_local.delete(k_in_trade(sym))
-                            r_local.delete(k_entry(sym))
-                            r_local.delete(k_sl(sym))
-                            r_local.delete(k_target(sym))
-                            r_local.delete(k_qty(sym))
-                            r_local.delete(k_override(sym))
-                            print(f"{sym} EXIT TARGET @ {price:.2f}")
 
         except Exception as e:
             print(f"[WORKER {worker_id}] error: {e}")
@@ -1353,6 +1506,7 @@ def squareoff_all():
             if redis_ok():
                 r.delete(k_in_trade(sym)); r.delete(k_entry(sym)); r.delete(k_sl(sym))
                 r.delete(k_target(sym)); r.delete(k_qty(sym)); r.delete(k_override(sym))
+                r.delete(k_sl_oid(sym)); r.delete(k_tgt_oid(sym))
 
         return {"ok": True, "message": "All positions squared off"}
     except Exception as e:
@@ -1380,4 +1534,4 @@ def reset_day():
 # MAIN
 # =========================
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False)
