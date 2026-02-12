@@ -128,6 +128,39 @@ elif isinstance(allowed_data, dict):
 else:
     raise ValueError("allowed_stocks.json format not supported")
 
+# =========================
+# Filter OUT derivative stocks at startup (simple local list)
+# =========================
+DERIV_LIST_FILE = "derivative_stocks.txt"
+
+def load_derivative_symbols(path: str) -> set[str]:
+    try:
+        out = set()
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip().upper()
+                if not s or s.startswith("#"):
+                    continue
+                out.add(s)
+        return out
+    except FileNotFoundError:
+        print(f"⚠️ {path} not found. Derivative filtering NOT applied.")
+        return set()
+    except Exception as e:
+        print(f"⚠️ Failed to read {path}: {e}. Derivative filtering NOT applied.")
+        return set()
+
+derivative_symbols = load_derivative_symbols(DERIV_LIST_FILE)
+
+if derivative_symbols:
+    before = len(allowed_stocks)
+    allowed_stocks = {sym: tok for sym, tok in allowed_stocks.items() if sym.upper() not in derivative_symbols}
+    after = len(allowed_stocks)
+    print(f"✅ Derivative filter applied: {before} -> {after} (removed {before-after})")
+else:
+    print("ℹ️ Derivative filter skipped (empty list)")
+
+# ✅ rebuild mapping AFTER filtering
 token_to_symbol = {v: k for k, v in allowed_stocks.items()}
 
 
@@ -138,6 +171,7 @@ _worker_procs = []
 _worker_queues = []
 _workers_started = False
 
+# ✅ IMPORTANT: build routing maps AFTER filtering
 TOKENS_SORTED = sorted([int(t) for t in allowed_stocks.values()])
 TOKEN_TO_WORKER = {tok: (i % WORKERS) for i, tok in enumerate(TOKENS_SORTED)}
 _worker_token_counts = [0] * WORKERS
@@ -415,10 +449,13 @@ def worker_main(worker_id: int, q: mp.Queue):
             o1, h1, l1, cl1 = c915["open"], c915["high"], c915["low"], c915["close"]
             o2, h2, l2, cl2 = c916["open"], c916["high"], c916["low"], c916["close"]
 
+            # ✅ STRATEGY RULE:
+            #  - 1st candle must be red
+            #  - 2nd candle can be red OR green
+            #  - but 2nd candle high must be < 1st candle high
             red1 = (cl1 < o1)
-            red2 = (cl2 < o2)
+            ignored = (not red1) or (h2 >= h1)
 
-            ignored = (not red1) or (not red2) or (h2 >= h1)
             pattern_ok = (not ignored)
             day_high = max(h1, h2)
 
@@ -559,22 +596,23 @@ def worker_main(worker_id: int, q: mp.Queue):
                 if not pe or pe["next_minute"] != minute_dt:
                     return
 
+                # ✅ ONLY BLOCK: no new trades after 09:30
                 if not within_new_trade_window(minute_dt):
                     pending_next_open.pop(sym, None)
                     return
 
-                trades_done = int(r_local.get(TRADES_DONE_KEY) or 0)
+                # ✅ ONLY BLOCK: max day pnl (-300 / +900)
                 pnl_total = float(r_local.get(PNL_KEY) or 0.0)
-                if trades_done >= MAX_TRADES:
+                if pnl_total <= MAX_DAILY_LOSS:
+                    r_local.set(TRADING_BLOCKED_KEY, "MAX_DAILY_LOSS")
                     pending_next_open.pop(sym, None)
                     return
-                if pnl_total <= MAX_DAILY_LOSS or pnl_total >= MAX_DAILY_PROFIT:
-                    r_local.set(TRADING_BLOCKED_KEY, "DAILY_LIMIT")
+                if pnl_total >= MAX_DAILY_PROFIT:
+                    r_local.set(TRADING_BLOCKED_KEY, "MAX_DAILY_PROFIT")
                     pending_next_open.pop(sym, None)
                     return
-                if r_local.get(TRADING_BLOCKED_KEY):
-                    pending_next_open.pop(sym, None)
-                    return
+
+                # (kept) prevent duplicate entry for same symbol while already in a trade
                 if r_local.get(k_in_trade(sym)):
                     pending_next_open.pop(sym, None)
                     return
