@@ -3,10 +3,12 @@ import datetime
 import json
 import os
 import multiprocessing as mp
-import redis
 import threading
-import time  # ✅ added
+import time
+from typing import Dict, Any, Optional, List, Tuple
+from zoneinfo import ZoneInfo
 
+import redis
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from kiteconnect import KiteConnect, KiteTicker
@@ -14,84 +16,75 @@ import uvicorn
 
 
 # =========================
-# CONFIG (MOVE TO ENV IN REAL USE)
+# TIMEZONE (India / Kolkata)
+# =========================
+IST = ZoneInfo("Asia/Kolkata")
+
+
+# =========================
+# CONFIG
 # =========================
 API_KEY = os.environ.get("KITE_API_KEY", "eeo1b4qfvxqt7spz")
 API_SECRET = os.environ.get("KITE_API_SECRET", "cq7z4ycp4ccezf4k9os2h0i24ba1hh0j")
 REDIRECT_URL = os.environ.get("KITE_REDIRECT_URL", "http://127.0.0.1:8000/zerodha/callback")
 
-# Strategy constraints
-WORKERS = int(os.environ.get("WORKERS", "6"))  # use 6 cores
+WORKERS = int(os.environ.get("WORKERS", "6"))
 MP_QUEUE_MAX = int(os.environ.get("MP_QUEUE_MAX", "20000"))
 
-MAX_TRADES = 6
-NO_NEW_TRADES_AFTER = datetime.time(9, 30)
-MAX_DAILY_LOSS = -300.0
-MAX_DAILY_PROFIT = 900.0
+# Strategy
+NO_NEW_TRADES_AFTER = datetime.time(9, 30)  # ✅ 09:30 AM IST
+RISK_PER_TRADE = 50.0
+BREAKOUT_VALUE_MIN = 1.5e7  # 1.5 cr
+PRODUCT = "MIS"
+EXCHANGE = "NSE"
 
-# ✅ changed default risk per trade to 50
-DEFAULT_RISK_PER_TRADE = 50.0
-BREAKOUT_VALUE_MIN = 1.5e7
-
-# ✅ allowed entry price range
 MIN_ENTRY_PRICE = 100.0
 MAX_ENTRY_PRICE = 5000.0
+MAX_TRADES = 6
 
-# ✅ NEW: hard rupee exits (per trade) and tick size
-HARD_MAX_LOSS_RUPEES = 50.0
-HARD_MAX_PROFIT_RUPEES = 150.0
-PRICE_TICK_SIZE = 0.05
+# ✅ NEW: SL rule
+SL_PCT_BELOW_ENTRY = 0.008  # 0.8%
 
-# Redis keys
+# Redis
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
 ACCESS_TOKEN_KEY = "access_token"
-RISK_KEY = "risk_per_trade"
+
+# Persisted for the day (until next access_token is generated)
+DAY_KEY = "day_key"
+POSITIONS_SNAPSHOT_KEY = "positions_snapshot_json"
+POSITIONS_SNAPSHOT_TS_KEY = "positions_snapshot_ts"
+LTP_MAP_KEY = "ltp_map_json"
+LTP_MAP_TS_KEY = "ltp_map_ts"
 TRADES_DONE_KEY = "trades_done"
-TRADING_BLOCKED_KEY = "trading_blocked"
-PNL_KEY = "pnl_total"
 
-# ✅ NEW: snapshot keys (to persist last known positions/pnl)
-POS_SNAPSHOT_KEY = "pos_snapshot_json"
-POS_SNAPSHOT_TS_KEY = "pos_snapshot_ts"
-
-# Per-symbol trade keys
+# Per-symbol keys
 def k_in_trade(sym): return f"in_trade:{sym}"
 def k_entry(sym): return f"entry_price:{sym}"
 def k_sl(sym): return f"sl:{sym}"
 def k_target(sym): return f"target:{sym}"
 def k_qty(sym): return f"qty:{sym}"
-def k_override(sym): return f"override:{sym}"  # {"sl":..., "target":...}
-
-# ✅ NEW: exit order ids (SL-M + Target LIMIT)
 def k_sl_oid(sym): return f"sl_order_id:{sym}"
 def k_tgt_oid(sym): return f"tgt_order_id:{sym}"
 
 
 # =========================
-# Tick heartbeat (in-memory) + per-worker status
+# GLOBAL STATE (for heartbeat)
 # =========================
+_tick_lock = threading.Lock()
 _ticks_total = 0
 _last_tick_ts = 0
 _last_tick_token = 0
 _last_tick_price = 0.0
 
-_worker_ticks_total = [0] * WORKERS
-_worker_last_tick_ts = [0] * WORKERS
-_worker_last_tick_token = [0] * WORKERS
-_worker_last_tick_price = [0.0] * WORKERS
-
-# Websocket status (separate from ticks)
 _ws_connected = False
 _ws_connected_ts = 0
 _ws_last_event_ts = 0
 _ws_last_error = ""
 
-_tick_lock = threading.Lock()
-
 
 # =========================
-# Redis
+# REDIS
 # =========================
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
 
@@ -104,21 +97,31 @@ def redis_ok() -> bool:
 
 
 # =========================
-# FastAPI + Kite
+# FASTAPI + KITE
 # =========================
 app = FastAPI()
 kite = KiteConnect(api_key=API_KEY)
 kite.redirect_url = REDIRECT_URL
 
 
+def ensure_kite_token_global() -> bool:
+    if not redis_ok():
+        return False
+    at = (r.get(ACCESS_TOKEN_KEY) or "").strip()
+    if not at:
+        return False
+    kite.set_access_token(at)
+    return True
+
+
 # =========================
-# Load Universe (1700 stocks)
+# LOAD UNIVERSE (allowed_stocks.json)
 # =========================
 with open("allowed_stocks.json", "r", encoding="utf-8") as f:
     allowed_data = json.load(f)
 
 if isinstance(allowed_data, list):
-    allowed_stocks = {
+    allowed_stocks: Dict[str, int] = {
         item["symbol"].upper(): int(item["token"])
         for item in allowed_data
         if isinstance(item, dict) and "symbol" in item and "token" in item
@@ -128,72 +131,25 @@ elif isinstance(allowed_data, dict):
 else:
     raise ValueError("allowed_stocks.json format not supported")
 
-# =========================
-# Filter OUT derivative stocks at startup (simple local list)
-# =========================
-DERIV_LIST_FILE = "derivative_stocks.txt"
-
-def load_derivative_symbols(path: str) -> set[str]:
-    try:
-        out = set()
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                s = line.strip().upper()
-                if not s or s.startswith("#"):
-                    continue
-                out.add(s)
-        return out
-    except FileNotFoundError:
-        print(f"⚠️ {path} not found. Derivative filtering NOT applied.")
-        return set()
-    except Exception as e:
-        print(f"⚠️ Failed to read {path}: {e}. Derivative filtering NOT applied.")
-        return set()
-
-derivative_symbols = load_derivative_symbols(DERIV_LIST_FILE)
-
-if derivative_symbols:
-    before = len(allowed_stocks)
-    allowed_stocks = {sym: tok for sym, tok in allowed_stocks.items() if sym.upper() not in derivative_symbols}
-    after = len(allowed_stocks)
-    print(f"✅ Derivative filter applied: {before} -> {after} (removed {before-after})")
-else:
-    print("ℹ️ Derivative filter skipped (empty list)")
-
-# ✅ rebuild mapping AFTER filtering
 token_to_symbol = {v: k for k, v in allowed_stocks.items()}
 
 
 # =========================
-# Multiprocessing setup
+# MULTIPROCESSING ROUTING
 # =========================
-_worker_procs = []
-_worker_queues = []
-_workers_started = False
-
-# ✅ IMPORTANT: build routing maps AFTER filtering
 TOKENS_SORTED = sorted([int(t) for t in allowed_stocks.values()])
 TOKEN_TO_WORKER = {tok: (i % WORKERS) for i, tok in enumerate(TOKENS_SORTED)}
 _worker_token_counts = [0] * WORKERS
+for tok, wid in TOKEN_TO_WORKER.items():
+    _worker_token_counts[int(wid)] += 1
 
+_worker_procs: List[mp.Process] = []
+_worker_queues: List[Any] = []
+_workers_started = False
 
-def ensure_kite_token_global():
-    if not redis_ok():
-        return
-    at = (r.get(ACCESS_TOKEN_KEY) or "").strip()
-    if at:
-        kite.set_access_token(at)
-
-def invalidate_access_token(reason: str):
-    """If KiteTicker gives 403, token is unusable for streaming. Force re-login."""
-    if not redis_ok():
-        return
-    print(f"⚠️ Invalidating access token: {reason}")
-    r.delete(ACCESS_TOKEN_KEY)
-    r.set(TRADING_BLOCKED_KEY, f"LOGIN_REQUIRED ({reason})")
 
 def _start_workers_if_needed():
-    global _workers_started, _worker_procs, _worker_queues, _worker_token_counts
+    global _workers_started, _worker_procs, _worker_queues
     if _workers_started:
         return
 
@@ -208,18 +164,13 @@ def _start_workers_if_needed():
         _worker_queues.append(q)
         _worker_procs.append(p)
 
-    _worker_token_counts[:] = [0] * WORKERS
-    for tok, wid in TOKEN_TO_WORKER.items():
-        _worker_token_counts[int(wid)] += 1
-
     _workers_started = True
     print(f"✅ Started {WORKERS} worker processes")
     print(f"✅ Token distribution: {_worker_token_counts}")
 
+
 def _route_tick_to_worker(tick: dict):
-    global _ticks_total, _last_tick_ts, _last_tick_token, _last_tick_price
-    global _worker_ticks_total, _worker_last_tick_ts, _worker_last_tick_token, _worker_last_tick_price
-    global _ws_last_event_ts
+    global _ticks_total, _last_tick_ts, _last_tick_token, _last_tick_price, _ws_last_event_ts
 
     token = tick.get("instrument_token")
     if token is None:
@@ -229,19 +180,24 @@ def _route_tick_to_worker(tick: dict):
 
     lp = tick.get("last_price")
     now = int(time.time())
+
     with _tick_lock:
         _ticks_total += 1
         _last_tick_ts = now
         _last_tick_token = int(token)
         _last_tick_price = float(lp) if lp is not None else 0.0
+        _ws_last_event_ts = now
 
-        _ws_last_event_ts = now  # ✅ any tick counts as WS activity
-
-        if 0 <= int(wid) < WORKERS:
-            _worker_ticks_total[int(wid)] += 1
-            _worker_last_tick_ts[int(wid)] = now
-            _worker_last_tick_token[int(wid)] = int(token)
-            _worker_last_tick_price[int(wid)] = float(lp) if lp is not None else 0.0
+    # store LTP in redis (shared for UI)
+    try:
+        if redis_ok() and lp is not None:
+            raw = r.get(LTP_MAP_KEY)
+            m = json.loads(raw) if raw else {}
+            m[str(int(token))] = float(lp)
+            r.set(LTP_MAP_KEY, json.dumps(m))
+            r.set(LTP_MAP_TS_KEY, str(now))
+    except Exception:
+        pass
 
     try:
         _worker_queues[int(wid)].put_nowait(tick)
@@ -250,12 +206,9 @@ def _route_tick_to_worker(tick: dict):
 
 
 # =========================
-# Strategy Helpers
+# STRATEGY HELPERS
 # =========================
-def is_red(open_px: float, close_px: float) -> bool:
-    return float(close_px) < float(open_px)
-
-def breakout_value_ok(close_px: float, vol_1m: float):
+def breakout_value_ok(close_px: float, vol_1m: float) -> Tuple[bool, float]:
     try:
         val = float(close_px) * float(vol_1m)
         return (val >= float(BREAKOUT_VALUE_MIN)), val
@@ -269,18 +222,17 @@ def risk_qty(entry: float, sl: float, risk: float) -> int:
     qty = int(float(risk) / diff)
     return max(qty, 0)
 
+def to_ist(dt: datetime.datetime) -> datetime.datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=IST)
+    return dt.astimezone(IST)
+
 def within_new_trade_window(ts: datetime.datetime) -> bool:
-    return ts.time() <= NO_NEW_TRADES_AFTER
-
-def first_candle_ts_ok(ts: datetime.datetime) -> bool:
-    return ts.hour == 9 and ts.minute == 15
-
-def second_candle_ts_ok(ts: datetime.datetime) -> bool:
-    return ts.hour == 9 and ts.minute == 16
+    return to_ist(ts).time() <= NO_NEW_TRADES_AFTER
 
 
 # =========================
-# Worker Strategy State (per process)
+# WORKER PROCESS
 # =========================
 def worker_main(worker_id: int, q: mp.Queue):
     r_local = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
@@ -302,18 +254,7 @@ def worker_main(worker_id: int, q: mp.Queue):
         if at:
             kite_local.set_access_token(at)
 
-    # ✅ NEW: helpers for hard rupee exits via SL-M + target LIMIT
-    def round_to_tick(price: float, tick: float = PRICE_TICK_SIZE) -> float:
-        try:
-            return round(round(float(price) / float(tick)) * float(tick), 2)
-        except Exception:
-            return float(price)
-
-    def wait_for_complete_and_avg(order_id: str, timeout_s: int = 10):
-        """
-        Poll order history until COMPLETE or timeout.
-        Returns (is_complete: bool, avg_price: float)
-        """
+    def wait_for_complete_and_avg(order_id: str, timeout_s: int = 10) -> Tuple[bool, float]:
         t0 = time.time()
         last_avg = 0.0
         while time.time() - t0 < timeout_s:
@@ -331,53 +272,27 @@ def worker_main(worker_id: int, q: mp.Queue):
                         return False, 0.0
             except Exception:
                 pass
-            time.sleep(0.5)
+            time.sleep(0.4)
         return False, 0.0
 
-    refresh_token()
-    print(f"[WORKER {worker_id}] started")
-
-    candle_1m = {}
-    mem = {}
-    pending_next_open = {}
-
     # ==========================================================
-    # ✅ REST-ONLY OPENING CANDLES (NO FALLBACK)
+    # ✅ REST OPENING CANDLES (ONE CALL, IST-NORMALIZED)
     # ==========================================================
-    _rest_c915 = {}  # sym -> candle dict
-    _rest_c916 = {}  # sym -> candle dict
+    _rest_opening: Dict[str, dict] = {}  # sym -> {"c915":..., "c916":...}
 
-    def _extract_minute_candle(data, hh: int, mm: int):
-        found = None
-        for c in data or []:
-            dt = c.get("date")
-            if dt is None:
-                continue
-            if isinstance(dt, str):
-                try:
-                    dt = datetime.datetime.fromisoformat(dt)
-                except Exception:
-                    continue
-            tt = dt.time()
-            if tt.hour == hh and tt.minute == mm:
-                found = c
-        return found
-
-    def fetch_single_candle(sym: str, hh: int, mm: int, window_end: datetime.time):
+    def fetch_opening_candles(sym: str) -> Optional[dict]:
         """
-        Fetch ONLY one target minute candle (hh:mm) using a tiny historical window.
-        Returns: candle dict or None
+        Fetch 09:15 and 09:16 candles in ONE REST call.
+        Range: 09:15 -> 09:18 (small buffer), then extract exact minutes by IST.
         """
         try:
             tok = allowed_stocks.get(sym)
             if not tok:
                 return None
 
-            today = datetime.date.today()
-
-            # buffer start 1 minute before target
-            start_dt = datetime.datetime.combine(today, datetime.time(hh, max(mm - 1, 0), 0))
-            end_dt = datetime.datetime.combine(today, window_end)
+            today = datetime.datetime.now(IST).date()
+            start_dt = datetime.datetime.combine(today, datetime.time(9, 15), tzinfo=IST)
+            end_dt = datetime.datetime.combine(today, datetime.time(9, 18), tzinfo=IST)
 
             data = kite_local.historical_data(
                 instrument_token=int(tok),
@@ -385,96 +300,95 @@ def worker_main(worker_id: int, q: mp.Queue):
                 to_date=end_dt,
                 interval="minute"
             )
-            c = _extract_minute_candle(data, hh, mm)
-            if not c:
+
+            c915 = None
+            c916 = None
+
+            for c in data or []:
+                dt = c.get("date")
+                if dt is None:
+                    continue
+                if isinstance(dt, str):
+                    try:
+                        dt = datetime.datetime.fromisoformat(dt)
+                    except Exception:
+                        continue
+
+                dt = to_ist(dt)
+                if dt.date() != today:
+                    continue
+
+                if dt.hour == 9 and dt.minute == 15:
+                    c915 = c
+                elif dt.hour == 9 and dt.minute == 16:
+                    c916 = c
+
+            if not c915 or not c916:
                 return None
 
             return {
-                "open": float(c["open"]),
-                "high": float(c["high"]),
-                "low": float(c["low"]),
-                "close": float(c["close"]),
+                "c915": {
+                    "open": float(c915["open"]),
+                    "high": float(c915["high"]),
+                    "low": float(c915["low"]),
+                    "close": float(c915["close"]),
+                },
+                "c916": {
+                    "open": float(c916["open"]),
+                    "high": float(c916["high"]),
+                    "low": float(c916["low"]),
+                    "close": float(c916["close"]),
+                },
             }
         except Exception:
             return None
 
     def try_lock_opening_from_rest(sym: str, ts: datetime.datetime, m: dict):
         """
-        Called on every tick. Will:
-          - fetch 09:15 after 09:16 begins (single attempt)
-          - fetch 09:16 after 09:17 begins (single attempt)
-          - when both present, lock pattern
-          - if missing after attempts -> ignore symbol (REST-only)
+        Lock opening candles once time >= 09:17 IST (so 09:16 is complete).
+        Single attempt only.
         """
         if m.get("open_locked") or m.get("ignored"):
             return
 
-        now_epoch = time.time()
+        ts = to_ist(ts)
 
-        # throttle (prevents hammering REST)
-        next_try = float(m.get("_rest_next_try", 0.0) or 0.0)
-        if now_epoch < next_try:
+        if not (ts.hour == 9 and ts.minute >= 17):
             return
 
-        # ✅ max attempts (CHANGED TO 1)
-        a1 = int(m.get("_rest_a915", 0) or 0)
-        a2 = int(m.get("_rest_a916", 0) or 0)
-        MAX_ATTEMPTS_EACH = 1  # ✅ CHANGED FROM 2 -> 1
+        if m.get("_rest_done"):
+            return
+        m["_rest_done"] = True
 
-        # 1) After 09:16 starts, fetch 09:15 candle if not cached
-        if (ts.hour == 9 and ts.minute >= 16) and (sym not in _rest_c915) and a1 < MAX_ATTEMPTS_EACH:
-            m["_rest_a915"] = a1 + 1
-            c = fetch_single_candle(sym, 9, 15, window_end=datetime.time(9, 16, 30))
-            if c:
-                _rest_c915[sym] = c
-            else:
-                # keep throttle but we won't retry due to MAX_ATTEMPTS_EACH=1
-                m["_rest_next_try"] = now_epoch + 0.7
-                return
+        got = _rest_opening.get(sym)
+        if not got:
+            got = fetch_opening_candles(sym)
+            if got:
+                _rest_opening[sym] = got
 
-        # 2) After 09:17 starts, fetch 09:16 candle if not cached
-        if (ts.hour == 9 and ts.minute >= 17) and (sym not in _rest_c916) and a2 < MAX_ATTEMPTS_EACH:
-            m["_rest_a916"] = a2 + 1
-            c = fetch_single_candle(sym, 9, 16, window_end=datetime.time(9, 17, 30))
-            if c:
-                _rest_c916[sym] = c
-            else:
-                m["_rest_next_try"] = now_epoch + 0.7
-                return
-
-        # 3) If both are available -> lock
-        c915 = _rest_c915.get(sym)
-        c916 = _rest_c916.get(sym)
-        if c915 and c916:
-            o1, h1, l1, cl1 = c915["open"], c915["high"], c915["low"], c915["close"]
-            o2, h2, l2, cl2 = c916["open"], c916["high"], c916["low"], c916["close"]
-
-            # ✅ STRATEGY RULE:
-            #  - 1st candle must be red
-            #  - 2nd candle can be red OR green
-            #  - but 2nd candle high must be < 1st candle high
-            red1 = (cl1 < o1)
-            ignored = (not red1) or (h2 >= h1)
-
-            pattern_ok = (not ignored)
-            day_high = max(h1, h2)
-
-            m["open_locked"] = True
-            m["ignored"] = bool(ignored)
-            m["c1"] = {"high": float(h1), "low": float(l1)}
-            m["c2"] = {"high": float(h2), "low": float(l2)}
-            m["pattern_ok"] = bool(pattern_ok)
-            m["day_high"] = float(day_high)
+        if not got:
+            m["ignored"] = True
             return
 
-        # 4) If reached attempts and still missing -> ignore (after 09:17)
-        if ts.hour == 9 and ts.minute >= 17:
-            if (sym not in _rest_c915 and int(m.get("_rest_a915", 0) or 0) >= MAX_ATTEMPTS_EACH) or \
-               (sym not in _rest_c916 and int(m.get("_rest_a916", 0) or 0) >= MAX_ATTEMPTS_EACH):
-                m["ignored"] = True
-                return
+        c915 = got["c915"]
+        c916 = got["c916"]
 
-    # ✅ NEW: monitor exit orders (OCO via cancel-other) without manual involvement
+        o1, h1, l1, cl1 = c915["open"], c915["high"], c915["low"], c915["close"]
+        o2, h2, l2, cl2 = c916["open"], c916["high"], c916["low"], c916["close"]
+
+        red1 = (cl1 < o1)
+        ignored = (not red1) or (h2 >= h1)
+
+        m["open_locked"] = True
+        m["ignored"] = bool(ignored)
+        m["pattern_ok"] = bool(not ignored)
+
+        # ✅ day_high includes BOTH 09:15 and 09:16 (09:15 is never skipped)
+        m["day_high"] = float(max(h1, h2))
+
+    # ==========================================================
+    # ✅ OCO MONITOR (CANCEL OTHER EXIT ORDER)
+    # ==========================================================
     def monitor_exit_orders():
         while True:
             try:
@@ -483,7 +397,6 @@ def worker_main(worker_id: int, q: mp.Queue):
                     time.sleep(1)
                     continue
 
-                # check only symbols that worker has seen (mem keys)
                 for sym in list(mem.keys()):
                     if not r_local.get(k_in_trade(sym)):
                         continue
@@ -505,36 +418,38 @@ def worker_main(worker_id: int, q: mp.Queue):
                     sl_st = status_of(sl_oid)
                     tg_st = status_of(tgt_oid)
 
-                    # If one is COMPLETE -> cancel the other
                     if sl_st == "COMPLETE" and tg_st not in ("CANCELLED", "REJECTED", "COMPLETE"):
                         try:
                             kite_local.cancel_order(variety=kite_local.VARIETY_REGULAR, order_id=tgt_oid)
-                            print(f"{sym} SL hit -> cancelled target {tgt_oid}")
-                        except Exception as e:
-                            print(f"{sym} cancel target failed: {e}")
+                        except Exception:
+                            pass
 
                     if tg_st == "COMPLETE" and sl_st not in ("CANCELLED", "REJECTED", "COMPLETE"):
                         try:
                             kite_local.cancel_order(variety=kite_local.VARIETY_REGULAR, order_id=sl_oid)
-                            print(f"{sym} TARGET hit -> cancelled SL {sl_oid}")
-                        except Exception as e:
-                            print(f"{sym} cancel SL failed: {e}")
+                        except Exception:
+                            pass
 
-                    # If either complete, clear redis tracking for this symbol
                     if sl_st == "COMPLETE" or tg_st == "COMPLETE":
                         r_local.delete(k_in_trade(sym))
                         r_local.delete(k_entry(sym))
                         r_local.delete(k_sl(sym))
                         r_local.delete(k_target(sym))
                         r_local.delete(k_qty(sym))
-                        r_local.delete(k_override(sym))
                         r_local.delete(k_sl_oid(sym))
                         r_local.delete(k_tgt_oid(sym))
 
-            except Exception as e:
-                print(f"[WORKER {worker_id}] monitor_exit_orders error: {e}")
+            except Exception:
+                pass
 
             time.sleep(1)
+
+    refresh_token()
+    print(f"[WORKER {worker_id}] started")
+
+    candle_1m: Dict[str, dict] = {}
+    mem: Dict[str, dict] = {}
+    pending_next_open: Dict[str, dict] = {}
 
     threading.Thread(target=monitor_exit_orders, daemon=True).start()
 
@@ -558,18 +473,11 @@ def worker_main(worker_id: int, q: mp.Queue):
             if sym not in mem:
                 mem[sym] = {
                     "ignored": False,
-                    "c1": None,
-                    "c2": None,
                     "pattern_ok": False,
                     "day_high": None,
                     "open_locked": False,
-
-                    # REST fetch controls
-                    "_rest_a915": 0,
-                    "_rest_a916": 0,
-                    "_rest_next_try": 0.0,
+                    "_rest_done": False,
                 }
-
             m = mem[sym]
             if m["ignored"]:
                 continue
@@ -579,11 +487,12 @@ def worker_main(worker_id: int, q: mp.Queue):
 
             ts = tick.get("exchange_timestamp")
             if ts is None:
-                ts = datetime.datetime.now()
+                ts = datetime.datetime.now(IST)
             elif isinstance(ts, str):
                 ts = datetime.datetime.fromisoformat(ts)
+            ts = to_ist(ts)
 
-            # ✅ REST-only: stage fetch 09:15 after 09:16 starts, 09:16 after 09:17 starts
+            # ✅ lock opening candles (REST one-call)
             try_lock_opening_from_rest(sym, ts, m)
             if m["ignored"]:
                 continue
@@ -596,57 +505,50 @@ def worker_main(worker_id: int, q: mp.Queue):
                 if not pe or pe["next_minute"] != minute_dt:
                     return
 
-                # ✅ ONLY BLOCK: no new trades after 09:30
+                # max trades
+                try:
+                    trades_done = int(r_local.get(TRADES_DONE_KEY) or "0")
+                except Exception:
+                    trades_done = 0
+                if trades_done >= MAX_TRADES:
+                    pending_next_open.pop(sym, None)
+                    return
+
+                # no new trades after 09:30 IST
                 if not within_new_trade_window(minute_dt):
                     pending_next_open.pop(sym, None)
                     return
 
-                # ✅ ONLY BLOCK: max day pnl (-300 / +900)
-                pnl_total = float(r_local.get(PNL_KEY) or 0.0)
-                if pnl_total <= MAX_DAILY_LOSS:
-                    r_local.set(TRADING_BLOCKED_KEY, "MAX_DAILY_LOSS")
-                    pending_next_open.pop(sym, None)
-                    return
-                if pnl_total >= MAX_DAILY_PROFIT:
-                    r_local.set(TRADING_BLOCKED_KEY, "MAX_DAILY_PROFIT")
-                    pending_next_open.pop(sym, None)
-                    return
-
-                # (kept) prevent duplicate entry for same symbol while already in a trade
+                # avoid duplicate entry
                 if r_local.get(k_in_trade(sym)):
                     pending_next_open.pop(sym, None)
                     return
 
-                risk = float(r_local.get(RISK_KEY) or DEFAULT_RISK_PER_TRADE)
                 entry = float(open_price)
 
-                # ✅ PRICE FILTER: allow entries only if entry is 100-5000
+                # ✅ price filter
                 if entry < MIN_ENTRY_PRICE or entry > MAX_ENTRY_PRICE:
                     pending_next_open.pop(sym, None)
                     return
 
-                # SL = closer to entry among:
-                #   1) Low of breakout candle (pe["sl"])
-                #   2) 0.9% below entry (entry * 0.991)
-                # For BUY, "closer" => higher SL => max()
+                # ✅ NEW SL RULE:
+                # SL = max( breakout_low , entry*(1-0.8%) ) for BUY (higher SL is nearer to entry)
                 sl_breakout = float(pe["sl"])
-                sl_09 = float(entry) * (1.0 - 0.009)
-                sl = max(sl_breakout, sl_09)
+                sl_08 = float(entry) * (1.0 - float(SL_PCT_BELOW_ENTRY))
+                sl = max(sl_breakout, sl_08)
 
                 if entry <= 0 or sl <= 0 or entry <= sl:
                     pending_next_open.pop(sym, None)
                     return
 
-                qty = risk_qty(entry, sl, risk)
+                qty = risk_qty(entry, sl, RISK_PER_TRADE)
                 if qty < 1:
                     pending_next_open.pop(sym, None)
                     return
 
-                # ✅ FIX: True 1:3 target from ENTRY price
                 target = entry + 3.0 * (entry - sl)
 
                 try:
-                    # ✅ BUY first (market)
                     buy_oid = kite_local.place_order(
                         variety=kite_local.VARIETY_REGULAR,
                         exchange=kite_local.EXCHANGE_NSE,
@@ -657,26 +559,12 @@ def worker_main(worker_id: int, q: mp.Queue):
                         order_type=kite_local.ORDER_TYPE_MARKET,
                     )
 
-                    # ✅ wait for actual average fill
                     filled, avg_fill = wait_for_complete_and_avg(buy_oid, timeout_s=10)
                     if not filled or avg_fill <= 0:
                         pending_next_open.pop(sym, None)
-                        print(f"{sym} BUY NOT COMPLETE / FAILED oid={buy_oid}")
                         return
 
-                    # ✅ compute HARD ₹ SL/Target prices from avg fill + qty
-                    sl_trigger = float(avg_fill) - (float(HARD_MAX_LOSS_RUPEES) / float(qty))
-                    tgt_price = float(avg_fill) + (float(HARD_MAX_PROFIT_RUPEES) / float(qty))
-
-                    sl_trigger = round_to_tick(sl_trigger)
-                    tgt_price = round_to_tick(tgt_price)
-
-                    if sl_trigger <= 0 or tgt_price <= 0:
-                        pending_next_open.pop(sym, None)
-                        print(f"{sym} BAD SL/TGT computed avg={avg_fill} qty={qty}")
-                        return
-
-                    # ✅ place SL-M (trigger only)
+                    # Place exits based on computed SL and target
                     sl_oid = kite_local.place_order(
                         variety=kite_local.VARIETY_REGULAR,
                         exchange=kite_local.EXCHANGE_NSE,
@@ -685,10 +573,9 @@ def worker_main(worker_id: int, q: mp.Queue):
                         quantity=int(qty),
                         product=kite_local.PRODUCT_MIS,
                         order_type=kite_local.ORDER_TYPE_SLM,
-                        trigger_price=float(sl_trigger),
+                        trigger_price=float(sl),
                     )
 
-                    # ✅ place Target LIMIT
                     tgt_oid = kite_local.place_order(
                         variety=kite_local.VARIETY_REGULAR,
                         exchange=kite_local.EXCHANGE_NSE,
@@ -697,25 +584,26 @@ def worker_main(worker_id: int, q: mp.Queue):
                         quantity=int(qty),
                         product=kite_local.PRODUCT_MIS,
                         order_type=kite_local.ORDER_TYPE_LIMIT,
-                        price=float(tgt_price),
+                        price=float(target),
                     )
 
-                    # ✅ store tracking (entry stored as avg fill for correct ₹ exits)
                     r_local.set(k_in_trade(sym), "BUY")
                     r_local.set(k_entry(sym), str(avg_fill))
-                    r_local.set(k_sl(sym), str(sl_trigger))
-                    r_local.set(k_target(sym), str(tgt_price))
+                    r_local.set(k_sl(sym), str(sl))
+                    r_local.set(k_target(sym), str(target))
                     r_local.set(k_qty(sym), str(int(qty)))
                     r_local.set(k_sl_oid(sym), str(sl_oid))
                     r_local.set(k_tgt_oid(sym), str(tgt_oid))
-                    r_local.incr(TRADES_DONE_KEY)
+
+                    try:
+                        r_local.incr(TRADES_DONE_KEY)
+                    except Exception:
+                        pass
 
                     pending_next_open.pop(sym, None)
-                    print(f"{sym} ENTRY avg={avg_fill:.2f} qty={qty} SLTrig={sl_trigger:.2f} TGT={tgt_price:.2f}")
 
-                except Exception as e:
+                except Exception:
                     pending_next_open.pop(sym, None)
-                    print(f"{sym} ENTRY FAILED: {e}")
 
             if cur is None:
                 candle_1m[sym] = {
@@ -737,24 +625,16 @@ def worker_main(worker_id: int, q: mp.Queue):
                 cur["vol_today_end"] = vol_today
                 continue
 
+            # candle closed
             closed = cur
             vol_1m = max(0.0, float(closed["vol_today_end"]) - float(closed["vol_today_start"]))
 
-            candle = {
-                "ts": closed["minute"],
-                "open": float(closed["open"]),
-                "high": float(closed["high"]),
-                "low": float(closed["low"]),
-                "close": float(closed["close"]),
-                "vol_1m": float(vol_1m),
-            }
+            candle_ts: datetime.datetime = closed["minute"]
+            c_high = float(closed["high"])
+            c_low = float(closed["low"])
+            c_close = float(closed["close"])
 
-            c_ts = candle["ts"]
-            c_high = candle["high"]
-            c_low = candle["low"]
-            c_close = candle["close"]
-
-            # ✅ REST-only rule: do NOTHING until open_locked is True
+            # do nothing until opening pattern is locked
             if not m.get("open_locked"):
                 candle_1m[sym] = {
                     "minute": minute_bucket,
@@ -768,23 +648,21 @@ def worker_main(worker_id: int, q: mp.Queue):
                 maybe_entry_on_open(minute_bucket, price)
                 continue
 
-            # ✅ from here onward: opening candles are REST-locked
             prev_day_high = float(m["day_high"] or c_high)
             m["day_high"] = max(prev_day_high, c_high)
 
-            if within_new_trade_window(c_ts):
+            # breakout detection at candle close -> entry next candle open
+            if within_new_trade_window(candle_ts):
                 if m["pattern_ok"] and (not r_local.get(k_in_trade(sym))) and (sym not in pending_next_open):
                     if c_high > prev_day_high:
-                        ok, _val = breakout_value_ok(c_close, candle["vol_1m"])
+                        ok, _val = breakout_value_ok(c_close, float(vol_1m))
                         if ok:
-                            entry_minute = minute_bucket
-                            sl = float(c_low)
-
                             pending_next_open[sym] = {
-                                "next_minute": entry_minute,
-                                "sl": sl,
+                                "next_minute": minute_bucket,
+                                "sl": float(c_low),  # breakout candle low (we will compare vs 0.8% at entry)
                             }
 
+            # start new candle
             candle_1m[sym] = {
                 "minute": minute_bucket,
                 "open": price,
@@ -796,49 +674,34 @@ def worker_main(worker_id: int, q: mp.Queue):
             }
             maybe_entry_on_open(minute_bucket, price)
 
-        except Exception as e:
-            print(f"[WORKER {worker_id}] error: {e}")
+        except Exception:
+            pass
 
     print(f"[WORKER {worker_id}] stopped")
 
 
 # =========================
-# KiteTicker runner (thread-safe for --reload)
+# KITE TICKER (FULL MODE)
 # =========================
 ticker_started = False
 ticker_running = False
 _ticker_lock = threading.Lock()
-_tkr = None
+_tkr: Optional[KiteTicker] = None
 
-def _token_is_valid_for_rest():
-    try:
-        ensure_kite_token_global()
-        kite.profile()
-        return True
-    except Exception as e:
-        print(f"⚠️ Token sanity check failed (kite.profile): {e}")
-        return False
 
 async def run_ticker():
     global ticker_running, _tkr
     global _ws_connected, _ws_connected_ts, _ws_last_event_ts, _ws_last_error
 
     if not redis_ok():
-        print("Redis not running. Cannot start ticker.")
         return
 
     access_token = (r.get(ACCESS_TOKEN_KEY) or "").strip()
     if not access_token:
-        print("No access token in Redis. Login first.")
-        return
-
-    if not _token_is_valid_for_rest():
-        invalidate_access_token("REST_TOKEN_INVALID")
         return
 
     with _ticker_lock:
         if ticker_running:
-            print("ℹ️ Ticker already running.")
             return
         ticker_running = True
 
@@ -870,7 +733,6 @@ async def run_ticker():
             _ws_last_event_ts = now
             _ws_last_error = ""
         tokens = list(allowed_stocks.values())
-        print(f"✅ KiteTicker connected. Subscribing FULL to {len(tokens)} tokens...")
         ws.subscribe(tokens)
         ws.set_mode(ws.MODE_FULL, tokens)
 
@@ -879,19 +741,16 @@ async def run_ticker():
         with _tick_lock:
             _ws_connected = False
             _ws_last_error = f"close {code}: {reason}"
-        print(f"⚠️ KiteTicker closed: code={code}, reason={reason}")
 
     def on_reconnect(ws, attempts_count):
         global _ws_last_event_ts
         with _tick_lock:
             _ws_last_event_ts = int(time.time())
-        print(f"↻ KiteTicker reconnecting... attempt={attempts_count}")
 
     def on_noreconnect(ws):
         global ticker_running, _ws_connected
         with _tick_lock:
             _ws_connected = False
-        print("❌ KiteTicker: no more reconnect attempts (max reached).")
         ticker_running = False
 
     def on_error(ws, code, reason):
@@ -899,12 +758,10 @@ async def run_ticker():
         msg = f"{code} - {reason}"
         with _tick_lock:
             _ws_last_error = msg
-        print(f"❌ KiteTicker error: {msg}")
         if "403" in msg or str(code) == "403":
             ticker_running = False
             with _tick_lock:
                 _ws_connected = False
-            invalidate_access_token("WS_403_FORBIDDEN")
             try:
                 ws.close()
             except Exception:
@@ -919,8 +776,8 @@ async def run_ticker():
 
     _tkr.connect(threaded=True)
 
+
 def start_ticker_background():
-    """Start ticker safely even under uvicorn --reload (Windows)."""
     def runner():
         try:
             asyncio.run(run_ticker())
@@ -934,7 +791,76 @@ def start_ticker_background():
 
 
 # =========================
-# Routes
+# POSITIONS SNAPSHOT UPDATER (for UI, low latency)
+# =========================
+def positions_snapshot_loop():
+    while True:
+        try:
+            if not redis_ok():
+                time.sleep(1)
+                continue
+            if not ensure_kite_token_global():
+                time.sleep(1)
+                continue
+
+            pos = kite.positions()
+            net = pos.get("net", [])
+            rows = []
+            total_pnl = 0.0
+
+            ltp_map = {}
+            try:
+                raw = r.get(LTP_MAP_KEY)
+                ltp_map = json.loads(raw) if raw else {}
+            except Exception:
+                ltp_map = {}
+
+            for p in net:
+                qty = int(p.get("quantity", 0))
+                if qty == 0:
+                    continue
+                sym = str(p.get("tradingsymbol", "")).upper()
+                avg = float(p.get("average_price") or 0.0)
+
+                tok = allowed_stocks.get(sym)
+                ltp = float(p.get("last_price") or 0.0)
+                if tok is not None:
+                    ltp = float(ltp_map.get(str(int(tok)), ltp) or ltp)
+
+                unreal = (ltp - avg) * qty
+                realised = float(p.get("realised") or 0.0)
+                pnl = float(unreal) + float(realised)
+                total_pnl += pnl
+
+                rows.append({
+                    "symbol": sym,
+                    "qty": qty,
+                    "avg": avg,
+                    "ltp": ltp,
+                    "pnl": pnl,
+                    "sl": (r.get(k_sl(sym)) or ""),
+                    "target": (r.get(k_target(sym)) or ""),
+                    "in_trade": bool(r.get(k_in_trade(sym)) or ""),
+                })
+
+            snap = {
+                "rows": rows,
+                "total_pnl": total_pnl,
+                "ts": int(time.time()),
+                "trades_done": int(r.get(TRADES_DONE_KEY) or "0"),
+                "max_trades": MAX_TRADES,
+            }
+            r.set(POSITIONS_SNAPSHOT_KEY, json.dumps(snap))
+            r.set(POSITIONS_SNAPSHOT_TS_KEY, str(snap["ts"]))
+
+        except Exception:
+            pass
+
+        time.sleep(1)
+
+
+# =========================
+# ROUTES
 # =========================
 @app.get("/health")
 def health():
@@ -945,11 +871,6 @@ def health():
         last_token = int(_last_tick_token or 0)
         last_price = float(_last_tick_price or 0.0)
 
-        w_ticks = list(_worker_ticks_total)
-        w_ts = list(_worker_last_tick_ts)
-        w_tok = list(_worker_last_tick_token)
-        w_px = list(_worker_last_tick_price)
-
         ws_connected = bool(_ws_connected)
         ws_connected_ts = int(_ws_connected_ts or 0)
         ws_last_event_ts = int(_ws_last_event_ts or 0)
@@ -959,19 +880,6 @@ def health():
     ws_age = (now - ws_last_event_ts) if ws_last_event_ts else None
     ws_conn_age = (now - ws_connected_ts) if ws_connected_ts else None
 
-    worker_stats = []
-    for i in range(WORKERS):
-        w_age = (now - int(w_ts[i])) if int(w_ts[i]) else None
-        worker_stats.append({
-            "worker": i,
-            "ticks_total": int(w_ticks[i]),
-            "last_tick_ts": int(w_ts[i] or 0),
-            "last_tick_age_s": w_age,
-            "last_tick_token": int(w_tok[i] or 0),
-            "last_tick_price": float(w_px[i] or 0.0),
-            "tokens_assigned": int(_worker_token_counts[i]) if i < len(_worker_token_counts) else 0,
-        })
-
     return {
         "status": "ok",
         "redis": redis_ok(),
@@ -980,71 +888,46 @@ def health():
         "token_distribution": _worker_token_counts,
         "has_access_token": bool((r.get(ACCESS_TOKEN_KEY) or "").strip()) if redis_ok() else False,
         "ticker_running": ticker_running,
-
-        # ticks (global)
         "ticks_total": ticks_total,
         "last_tick_ts": last_ts,
         "last_tick_age_s": tick_age,
         "last_tick_token": last_token,
         "last_tick_price": last_price,
-
-        # websocket status (separate)
         "ws_connected": ws_connected,
         "ws_connected_age_s": ws_conn_age,
         "ws_last_event_age_s": ws_age,
         "ws_last_error": ws_last_error,
-
-        # per-worker
-        "worker_stats": worker_stats,
     }
 
-@app.post("/start-ticker")
-def start_ticker_api():
-    start_ticker_background()
-    return {"ok": True, "message": "ticker start requested"}
 
-@app.post("/stop-ticker")
-def stop_ticker_api():
-    global ticker_running, _tkr
-    global _ws_connected
-    try:
-        if _tkr is not None:
-            _tkr.close()
-    except Exception:
-        pass
-    with _tick_lock:
-        _ws_connected = False
-    ticker_running = False
-    return {"ok": True, "message": "ticker stop requested"}
-
-# ✅ LOGOUT ROUTE (CHANGED MINIMALLY: stop ticker but DO NOT delete access token)
-@app.post("/logout")
-def logout():
+@app.get("/state")
+def state():
     if not redis_ok():
-        return JSONResponse({"ok": False, "error": "Redis not running"}, status_code=500)
+        return {"ok": False, "error": "Redis not running"}
 
-    # Stop ticker if running (safe to call)
-    global ticker_running, _tkr
-    global _ws_connected
-    try:
-        if _tkr is not None:
-            _tkr.close()
-    except Exception:
-        pass
-    with _tick_lock:
-        _ws_connected = False
-    ticker_running = False
+    snap = None
+    ts = None
+    raw = r.get(POSITIONS_SNAPSHOT_KEY)
+    ts = r.get(POSITIONS_SNAPSHOT_TS_KEY)
+    if raw:
+        try:
+            snap = json.loads(raw)
+        except Exception:
+            snap = None
 
-    # ✅ CHANGED: do NOT delete ACCESS_TOKEN_KEY (keeps positions/pnl available)
-    r.set(TRADING_BLOCKED_KEY, "LOGGED_OUT_UI_ONLY")
+    return {
+        "ok": True,
+        "positions": snap or {"rows": [], "total_pnl": 0.0, "ts": None, "trades_done": 0, "max_trades": MAX_TRADES},
+        "positions_ts": ts,
+    }
 
-    return {"ok": True, "message": "Ticker stopped. Positions/P&L remain visible. Login again only if you want to trade."}
 
 @app.get("/login")
 def login():
     if redis_ok() and (r.get(ACCESS_TOKEN_KEY) or "").strip():
         return RedirectResponse(url="/", status_code=303)
     return RedirectResponse(kite.login_url())
+
 
 @app.get("/zerodha/callback")
 async def callback(request: Request):
@@ -1054,14 +937,8 @@ async def callback(request: Request):
 
     if redis_ok():
         r.set(ACCESS_TOKEN_KEY, access_token)
-
-        r.set(RISK_KEY, str(DEFAULT_RISK_PER_TRADE))  # ✅ force 50 every login
-
-        if not r.get(TRADES_DONE_KEY):
-            r.set(TRADES_DONE_KEY, "0")
-        if not r.get(PNL_KEY):
-            r.set(PNL_KEY, "0")
-        r.delete(TRADING_BLOCKED_KEY)
+        r.set(DAY_KEY, str(int(time.time())))
+        r.set(TRADES_DONE_KEY, "0")
 
     kite.set_access_token(access_token)
 
@@ -1072,33 +949,133 @@ async def callback(request: Request):
 
     return RedirectResponse(url="/", status_code=303)
 
-@app.on_event("startup")
-async def startup_event():
+
+@app.post("/override")
+def set_override(symbol: str = Form(...), sl: str = Form(...), target: str = Form(...)):
     if not redis_ok():
-        print("⚠️ Redis not running. Start Redis on localhost:6379")
-        return
+        return JSONResponse({"ok": False, "error": "Redis not running"}, status_code=500)
+    if not ensure_kite_token_global():
+        return JSONResponse({"ok": False, "error": "Login required"}, status_code=401)
 
-    # ✅ force 50 on every restart (prevents old Redis value like 75)
-    r.set(RISK_KEY, str(DEFAULT_RISK_PER_TRADE))
+    sym = symbol.strip().upper()
+    try:
+        sl_v = float(sl)
+        t_v = float(target)
+    except Exception:
+        return JSONResponse({"ok": False, "error": "Invalid SL/Target"}, status_code=400)
 
-    if not r.get(TRADES_DONE_KEY):
-        r.set(TRADES_DONE_KEY, "0")
-    if not r.get(PNL_KEY):
-        r.set(PNL_KEY, "0")
-    r.delete(TRADING_BLOCKED_KEY)
+    try:
+        sl_oid = (r.get(k_sl_oid(sym)) or "").strip()
+        tgt_oid = (r.get(k_tgt_oid(sym)) or "").strip()
 
-    _start_workers_if_needed()
+        if sl_oid:
+            try:
+                kite.cancel_order(variety=kite.VARIETY_REGULAR, order_id=sl_oid)
+            except Exception:
+                pass
+        if tgt_oid:
+            try:
+                kite.cancel_order(variety=kite.VARIETY_REGULAR, order_id=tgt_oid)
+            except Exception:
+                pass
 
-    global ticker_started
-    if (r.get(ACCESS_TOKEN_KEY) or "").strip() and not ticker_started:
-        if _token_is_valid_for_rest():
-            ticker_started = True
-            start_ticker_background()
-            print("✅ access_token found -> requested ticker start")
-        else:
-            invalidate_access_token("REST_TOKEN_INVALID_ON_STARTUP")
+        qty = int(r.get(k_qty(sym)) or "0")
+        if qty <= 0:
+            pos = kite.positions().get("net", [])
+            for p in pos:
+                if str(p.get("tradingsymbol", "")).upper() == sym:
+                    qty = abs(int(p.get("quantity", 0)))
+                    break
 
-    print("Startup done.")
+        if qty <= 0:
+            return JSONResponse({"ok": False, "error": "No quantity found for symbol"}, status_code=400)
+
+        new_sl_oid = kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange=kite.EXCHANGE_NSE,
+            tradingsymbol=sym,
+            transaction_type=kite.TRANSACTION_TYPE_SELL,
+            quantity=int(qty),
+            product=kite.PRODUCT_MIS,
+            order_type=kite.ORDER_TYPE_SLM,
+            trigger_price=float(sl_v),
+        )
+        new_tgt_oid = kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange=kite.EXCHANGE_NSE,
+            tradingsymbol=sym,
+            transaction_type=kite.TRANSACTION_TYPE_SELL,
+            quantity=int(qty),
+            product=kite.PRODUCT_MIS,
+            order_type=kite.ORDER_TYPE_LIMIT,
+            price=float(t_v),
+        )
+
+        r.set(k_sl(sym), str(sl_v))
+        r.set(k_target(sym), str(t_v))
+        r.set(k_qty(sym), str(int(qty)))
+        r.set(k_sl_oid(sym), str(new_sl_oid))
+        r.set(k_tgt_oid(sym), str(new_tgt_oid))
+
+        return {"ok": True, "symbol": sym, "sl": sl_v, "target": t_v, "qty": qty}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/exit/{symbol}")
+def exit_symbol(symbol: str):
+    if not redis_ok():
+        return JSONResponse({"ok": False, "error": "Redis not running"}, status_code=500)
+    if not ensure_kite_token_global():
+        return JSONResponse({"ok": False, "error": "Login required"}, status_code=401)
+
+    sym = symbol.strip().upper()
+
+    try:
+        sl_oid = (r.get(k_sl_oid(sym)) or "").strip()
+        tgt_oid = (r.get(k_tgt_oid(sym)) or "").strip()
+        if sl_oid:
+            try:
+                kite.cancel_order(variety=kite.VARIETY_REGULAR, order_id=sl_oid)
+            except Exception:
+                pass
+        if tgt_oid:
+            try:
+                kite.cancel_order(variety=kite.VARIETY_REGULAR, order_id=tgt_oid)
+            except Exception:
+                pass
+
+        qty = 0
+        pos = kite.positions().get("net", [])
+        for p in pos:
+            if str(p.get("tradingsymbol", "")).upper() == sym:
+                qty = int(p.get("quantity", 0))
+                break
+        if qty == 0:
+            return {"ok": True, "message": "No position"}
+
+        txn = kite.TRANSACTION_TYPE_SELL if qty > 0 else kite.TRANSACTION_TYPE_BUY
+        kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange=kite.EXCHANGE_NSE,
+            tradingsymbol=sym,
+            transaction_type=txn,
+            quantity=abs(int(qty)),
+            product=kite.PRODUCT_MIS,
+            order_type=kite.ORDER_TYPE_MARKET,
+        )
+
+        r.delete(k_in_trade(sym))
+        r.delete(k_entry(sym))
+        r.delete(k_sl(sym))
+        r.delete(k_target(sym))
+        r.delete(k_qty(sym))
+        r.delete(k_sl_oid(sym))
+        r.delete(k_tgt_oid(sym))
+
+        return {"ok": True, "message": "Exit placed"}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 # ----------- Dashboard UI -----------
@@ -1111,19 +1088,14 @@ def dashboard():
         else '<button onclick="window.location.href=\'/login\'">Login to Zerodha</button>'
     )
 
-    risk = (r.get(RISK_KEY) if redis_ok() else str(DEFAULT_RISK_PER_TRADE)) or str(DEFAULT_RISK_PER_TRADE)
-    trades_done = (r.get(TRADES_DONE_KEY) if redis_ok() else "0") or "0"
-    blocked = (r.get(TRADING_BLOCKED_KEY) if redis_ok() else "") or ""
-
     html = """
     <html>
     <head>
-      <title>Goutham's_custard_apple</title>
-
+      <title>FASTAPI Kite Algotrading</title>
       <style>
         body { font-family: Arial, sans-serif; padding: 18px; }
         .row { display:flex; gap:12px; flex-wrap:wrap; margin: 10px 0; }
-        .card { border:1px solid #ddd; border-radius:10px; padding:12px; min-width:240px; }
+        .card { border:1px solid #ddd; border-radius:10px; padding:12px; min-width:280px; }
         .pnl-pos { color: green; font-weight: bold; }
         .pnl-neg { color: red; font-weight: bold; }
         table { border-collapse: collapse; width: 100%; margin-top: 10px; }
@@ -1132,7 +1104,6 @@ def dashboard():
         input { width: 110px; padding:4px; }
         button { padding: 6px 12px; cursor: pointer; }
         .tiny { font-size: 12px; opacity: 0.9; margin-top: 8px; }
-
         .badge {
           display: inline-block;
           padding: 2px 8px;
@@ -1146,71 +1117,39 @@ def dashboard():
         .badge-idle { background: #fff7dd; color: #7a5a00; border-color: #ffe29a; }
         .badge-off { background: #f2f2f2; color: #555; border-color: #ddd; }
         .badge-bad { background: #fdecec; color: #a32121; border-color: #f4bcbc; }
-
-        .wtable { margin-top: 10px; }
-        .wtable th, .wtable td { font-size: 12px; padding: 6px; }
       </style>
     </head>
     <body>
-      <h1>Goutham's custard apple</h1>
-
+      <h1>FASTAPI Kite Algotrading</h1>
 
       <div class="row">
         <div class="card">
           __LOGIN_BTN__
-          <div style="margin-top:10px;">
-            <button onclick="resetDay()">Reset Day</button>
-            <button onclick="squareoffAll()">Square Off All</button>
-            <button onclick="startTicker()">Start Ticker</button>
-            <button onclick="stopTicker()">Stop Ticker</button>
-            <button onclick="logout()">Logout</button>
-          </div>
-
-          <div class="tiny">
+          <div class="tiny" style="margin-top:10px;">
             <b>Tick heartbeat:</b>
             <span id="tickBadge" class="badge badge-off">OFF</span>
             <span id="tickHb">-</span>
           </div>
-
-          <table class="wtable" style="width:100%;">
-            <thead>
-              <tr>
-                <th>Worker</th>
-                <th>Status</th>
-                <th>ticks</th>
-                <th>age_s</th>
-                <th>token</th>
-                <th>price</th>
-              </tr>
-            </thead>
-            <tbody id="workersBody">
-              <tr><td colspan="6">Loading...</td></tr>
-            </tbody>
-          </table>
         </div>
 
         <div class="card">
-          <div><b>Risk per trade:</b></div>
-          <div style="margin-top:6px;">
-            <input id="risk" value="__RISK__">
-            <button onclick="updateRisk()">Update</button>
-          </div>
-          <div style="margin-top:10px;"><b>Trades done:</b> <span id="tradesDone">__TRADES_DONE__</span> / __MAX_TRADES__</div>
-          <div style="margin-top:6px;"><b>Trading blocked:</b> <span id="blocked">__BLOCKED__</span></div>
-          <div style="margin-top:6px;"><b>No new trades after:</b> 09:30</div>
-          <div class="tiny" style="margin-top:10px;"><b>Entry price filter:</b> 100 to 5000</div>
-        </div>
-
-        <div class="card">
-          <div><b>Active P&amp;L (updates every 3s):</b></div>
+          <div><b>Active P&amp;L (updates every 1s):</b></div>
           <div style="font-size:22px; margin-top:8px;">
             <span id="totalPnl" class="pnl-pos">0.00</span>
+          </div>
+          <div class="tiny" style="margin-top:8px;">
+            <b>Risk per trade:</b> 50 (Qty = 50 / (Entry - SL))<br>
+            <b>SL rule:</b> max(BreakoutLow, Entry - 0.8%) (nearer to entry)<br>
+            <b>Entry price range:</b> 100 to 5000<br>
+            <b>Max trades:</b> 6<br>
+            <b>No new trades after:</b> 09:30 AM (Asia/Kolkata)<br>
+            <b>Breakout value:</b> LTP * 1mVolume >= 1.5cr
           </div>
         </div>
       </div>
 
       <h2>Positions (MIS)</h2>
-      <div>Change SL / Target from UI. Changes apply immediately.</div>
+      <div>Change SL / Target from UI. Changes apply immediately (replaces exit orders).</div>
 
       <table>
         <thead>
@@ -1231,35 +1170,27 @@ def dashboard():
           if (!h.ticker_running) return {cls:"badge badge-off", txt:"OFF"};
           if (!h.ws_connected) return {cls:"badge badge-bad", txt:"DISCONNECTED"};
           const tickAge = (h.last_tick_age_s === null || h.last_tick_age_s === undefined) ? null : Number(h.last_tick_age_s);
-          if (tickAge !== null && tickAge <= 3) return {cls:"badge badge-live", txt:"LIVE"};
+          if (tickAge !== null && tickAge <= 2) return {cls:"badge badge-live", txt:"LIVE"};
           return {cls:"badge badge-idle", txt:"CONNECTED (NO TICKS)"};
         }
 
-        function statusBadgeWorker(h, age){
-          if (!h.ticker_running) return {cls:"badge badge-off", txt:"OFF"};
-          if (!h.ws_connected) return {cls:"badge badge-bad", txt:"DISCONNECTED"};
-          if (age !== null && age !== undefined && Number(age) <= 3) return {cls:"badge badge-live", txt:"LIVE"};
-          return {cls:"badge badge-idle", txt:"IDLE"};
-        }
+        async function refreshHeartbeat(){
+          const res = await fetch("/health?ts=" + Date.now(), { cache: "no-store" });
+          const h = await res.json();
 
-        async function startTicker(){ await fetch("/start-ticker", { method: "POST" }); }
-        async function stopTicker(){ await fetch("/stop-ticker", { method: "POST" }); }
+          const hb = document.getElementById("tickHb");
+          const badgeEl = document.getElementById("tickBadge");
+          if (!hb || !badgeEl) return;
 
-        // ✅ CHANGED text only (logic same): logout stops ticker but keeps positions/pnl visible
-        async function logout(){
-          const ok = confirm("Stop ticker? (Positions/P&L will still remain visible)");
-          if(!ok) return;
-          await fetch("/logout", { method: "POST" });
-          window.location.reload();
-        }
+          const b = statusBadgeGlobal(h);
+          badgeEl.className = b.cls;
+          badgeEl.textContent = b.txt;
 
-        async function updateRisk(){
-          const risk = document.getElementById("risk").value;
-          await fetch("/settings/risk", {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: "risk=" + encodeURIComponent(risk)
-          });
+          hb.textContent =
+            "ticks=" + (h.ticks_total ?? 0) +
+            ", tick_age_s=" + (h.last_tick_age_s ?? "-") +
+            ", ws_age_s=" + (h.ws_last_event_age_s ?? "-") +
+            (h.ws_last_error ? (", ws_err=" + h.ws_last_error) : "");
         }
 
         async function updateSlTarget(sym){
@@ -1276,75 +1207,11 @@ def dashboard():
           await fetch("/exit/" + encodeURIComponent(sym), { method: "POST" });
         }
 
-        async function squareoffAll(){
-          const ok = confirm("Square off ALL positions?");
-          if(!ok) return;
-          await fetch("/squareoff", { method: "POST" });
-        }
-
-        async function resetDay(){
-          const ok = confirm("Reset day counters (pnl, trades_done, unblock)?");
-          if(!ok) return;
-          await fetch("/reset-day", { method: "POST" });
-        }
-
-        async function refreshHeartbeat(){
-          const res = await fetch("/health?ts=" + Date.now(), { cache: "no-store" });
-          const h = await res.json();
-
-          const hb = document.getElementById("tickHb");
-          const badgeEl = document.getElementById("tickBadge");
-          const workersBody = document.getElementById("workersBody");
-          if (!hb || !badgeEl || !workersBody) return;
-
-          const b = statusBadgeGlobal(h);
-          badgeEl.className = b.cls;
-          badgeEl.textContent = b.txt;
-
-          hb.textContent =
-            "ticks=" + (h.ticks_total ?? 0) +
-            ", tick_age_s=" + (h.last_tick_age_s ?? "-") +
-            ", ws_age_s=" + (h.ws_last_event_age_s ?? "-") +
-            (h.ws_last_error ? (", ws_err=" + h.ws_last_error) : "");
-
-          workersBody.innerHTML = "";
-          const ws = h.worker_stats || [];
-          if (!ws.length){
-            workersBody.innerHTML = "<tr><td colspan='6'>No worker stats</td></tr>";
-            return;
-          }
-
-          for (const w of ws){
-            const age = (w.last_tick_age_s === null || w.last_tick_age_s === undefined) ? null : Number(w.last_tick_age_s);
-            const wb = statusBadgeWorker(h, age);
-
-            const tr = document.createElement("tr");
-            tr.innerHTML = `
-              <td>${Number(w.worker)}</td>
-              <td><span class="${wb.cls}">${wb.txt}</span></td>
-              <td>${Number(w.ticks_total || 0)}</td>
-              <td>${(age === null) ? "-" : age}</td>
-              <td>${Number(w.last_tick_token || 0)}</td>
-              <td>${Number(w.last_tick_price || 0).toFixed(2)}</td>
-            `;
-            workersBody.appendChild(tr);
-          }
-        }
-
         async function refreshPositions(){
-          const res = await fetch("/positions-table?ts=" + Date.now(), { cache: "no-store" });
+          const res = await fetch("/state?ts=" + Date.now(), { cache: "no-store" });
           const data = await res.json();
 
-          // ✅ CHANGED MINIMALLY: allow cached snapshot even if needs_login is true
-          if (data.needs_login && !(data.rows && data.rows.length)){
-            document.getElementById("posBody").innerHTML = '<tr><td colspan="9">Please login</td></tr>';
-            return;
-          }
-
-          document.getElementById("tradesDone").textContent = String(data.trades_done ?? 0);
-          document.getElementById("blocked").textContent = String(data.blocked ?? "-");
-
-          const total = Number(data.total_pnl || 0);
+          const total = Number((data.positions && data.positions.total_pnl) || 0);
           const pnlEl = document.getElementById("totalPnl");
           pnlEl.textContent = total.toFixed(2);
           pnlEl.className = pnlClass(total);
@@ -1352,12 +1219,13 @@ def dashboard():
           const body = document.getElementById("posBody");
           body.innerHTML = "";
 
-          if (!data.rows || data.rows.length === 0){
+          const rows = (data.positions && data.positions.rows) ? data.positions.rows : [];
+          if (!rows.length){
             body.innerHTML = "<tr><td colspan='9'>No positions</td></tr>";
             return;
           }
 
-          for (const rr of data.rows){
+          for (const rr of rows){
             const sym = String(rr.symbol || "").toUpperCase();
             const pnl = Number(rr.pnl || 0);
             const qty = Number(rr.qty || 0);
@@ -1385,187 +1253,35 @@ def dashboard():
         setInterval(refreshHeartbeat, 1000);
 
         refreshPositions();
-        setInterval(refreshPositions, 3000);
+        setInterval(refreshPositions, 1000);
       </script>
     </body>
     </html>
     """
 
-    html = (
-        html.replace("__LOGIN_BTN__", login_btn)
-            .replace("__RISK__", str(risk))
-            .replace("__TRADES_DONE__", str(trades_done))
-            .replace("__BLOCKED__", str(blocked or "-"))
-            .replace("__MAX_TRADES__", str(MAX_TRADES))
-    )
+    html = html.replace("__LOGIN_BTN__", login_btn)
     return HTMLResponse(html)
 
 
-@app.post("/settings/risk")
-def update_risk(risk: str = Form(...)):
+@app.on_event("startup")
+async def startup_event():
     if not redis_ok():
-        return JSONResponse({"ok": False, "error": "Redis not running"}, status_code=500)
+        print("⚠️ Redis not running. Start Redis on localhost:6379")
+        return
 
-    # ✅ HARD LOCK: Risk is ALWAYS 50 (cannot become 75)
-    r.set(RISK_KEY, str(DEFAULT_RISK_PER_TRADE))
-    return {"ok": True, "risk": DEFAULT_RISK_PER_TRADE}
+    if not r.get(TRADES_DONE_KEY):
+        r.set(TRADES_DONE_KEY, "0")
 
+    _start_workers_if_needed()
 
-@app.post("/override")
-def set_override(symbol: str = Form(...), sl: str = Form(...), target: str = Form(...)):
-    if not redis_ok():
-        return JSONResponse({"ok": False, "error": "Redis not running"}, status_code=500)
+    global ticker_started
+    if (r.get(ACCESS_TOKEN_KEY) or "").strip() and not ticker_started:
+        ticker_started = True
+        start_ticker_background()
 
-    sym = symbol.strip().upper()
-    try:
-        sl_v = float(sl) if sl.strip() else None
-        t_v = float(target) if target.strip() else None
-        r.set(k_override(sym), json.dumps({"sl": sl_v, "target": t_v}))
-        return {"ok": True, "symbol": sym, "sl": sl_v, "target": t_v}
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    threading.Thread(target=positions_snapshot_loop, daemon=True).start()
 
-@app.get("/positions-table")
-def positions_table():
-    # ✅ NEW: return cached snapshot if Kite call fails
-    def cached_snapshot(needs_login=False, error_msg=""):
-        snap = None
-        ts = None
-        if redis_ok():
-            raw = r.get(POS_SNAPSHOT_KEY)
-            ts = r.get(POS_SNAPSHOT_TS_KEY)
-            if raw:
-                try:
-                    snap = json.loads(raw)
-                except Exception:
-                    snap = None
-
-        if snap:
-            snap["ok"] = True
-            snap["cached"] = True
-            snap["cached_ts"] = ts
-            snap["needs_login"] = needs_login
-            if error_msg:
-                snap["warning"] = error_msg
-            return snap
-
-        return {
-            "ok": False,
-            "cached": False,
-            "needs_login": needs_login,
-            "error": error_msg or "No cached snapshot available"
-        }
-
-    try:
-        ensure_kite_token_global()
-        pos = kite.positions()
-    except Exception as e:
-        msg = str(e)
-        if "TokenException" in msg or "access_token" in msg:
-            return JSONResponse(cached_snapshot(needs_login=True, error_msg=msg), status_code=200)
-        return JSONResponse(cached_snapshot(needs_login=False, error_msg=msg), status_code=200)
-
-    net = pos.get("net", [])
-    rows = []
-    total_pnl = 0.0
-
-    for p in net:
-        qty = int(p.get("quantity", 0))
-        if qty == 0:
-            continue
-
-        sym = str(p.get("tradingsymbol", "")).upper()
-        avg_price = float(p.get("average_price") or 0.0)
-        ltp = float(p.get("last_price") or 0.0)
-        pnl = float(p.get("unrealised") or 0.0) + float(p.get("realised") or 0.0)
-        total_pnl += pnl
-
-        sl = r.get(k_sl(sym)) if redis_ok() else None
-        target = r.get(k_target(sym)) if redis_ok() else None
-
-        rows.append({
-            "symbol": sym,
-            "qty": qty,
-            "avg": avg_price,
-            "ltp": ltp,
-            "pnl": pnl,
-            "sl": sl,
-            "target": target,
-        })
-
-    if redis_ok():
-        r.set(PNL_KEY, str(total_pnl))
-        if total_pnl <= MAX_DAILY_LOSS:
-            r.set(TRADING_BLOCKED_KEY, "MAX_DAILY_LOSS")
-        elif total_pnl >= MAX_DAILY_PROFIT:
-            r.set(TRADING_BLOCKED_KEY, "MAX_DAILY_PROFIT")
-
-        # ✅ NEW: store snapshot so UI can show it even after logout/temp Kite errors
-        snapshot = {
-            "rows": rows,
-            "total_pnl": total_pnl,
-            "trades_done": int(r.get(TRADES_DONE_KEY) or 0),
-            "blocked": (r.get(TRADING_BLOCKED_KEY) or ""),
-        }
-        r.set(POS_SNAPSHOT_KEY, json.dumps(snapshot))
-        r.set(POS_SNAPSHOT_TS_KEY, str(int(time.time())))
-
-    return {
-        "ok": True,
-        "cached": False,
-        "rows": rows,
-        "total_pnl": total_pnl,
-        "trades_done": int(r.get(TRADES_DONE_KEY) or 0) if redis_ok() else 0,
-        "blocked": (r.get(TRADING_BLOCKED_KEY) or "") if redis_ok() else "",
-    }
-
-@app.post("/squareoff")
-def squareoff_all():
-    ensure_kite_token_global()
-    try:
-        positions = kite.positions().get("net", [])
-        for p in positions:
-            qty = int(p.get("quantity", 0))
-            if qty == 0:
-                continue
-            sym = str(p.get("tradingsymbol", "")).upper()
-            txn = kite.TRANSACTION_TYPE_SELL if qty > 0 else kite.TRANSACTION_TYPE_BUY
-
-            kite.place_order(
-                variety=kite.VARIETY_REGULAR,
-                exchange=p.get("exchange", kite.EXCHANGE_NSE),
-                tradingsymbol=sym,
-                transaction_type=txn,
-                quantity=abs(qty),
-                product=kite.PRODUCT_MIS,
-                order_type=kite.ORDER_TYPE_MARKET,
-            )
-
-            if redis_ok():
-                r.delete(k_in_trade(sym)); r.delete(k_entry(sym)); r.delete(k_sl(sym))
-                r.delete(k_target(sym)); r.delete(k_qty(sym)); r.delete(k_override(sym))
-                r.delete(k_sl_oid(sym)); r.delete(k_tgt_oid(sym))
-
-        return {"ok": True, "message": "All positions squared off"}
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
-@app.post("/reset-day")
-def reset_day():
-    if not redis_ok():
-        return JSONResponse({"ok": False, "error": "Redis not running"}, status_code=500)
-    r.set(PNL_KEY, "0")
-    r.set(TRADES_DONE_KEY, "0")
-    r.delete(TRADING_BLOCKED_KEY)
-
-    # ✅ reset risk back to 50 on reset-day also
-    r.set(RISK_KEY, str(DEFAULT_RISK_PER_TRADE))
-
-    # ✅ NEW: clear cached snapshot on reset-day
-    r.delete(POS_SNAPSHOT_KEY)
-    r.delete(POS_SNAPSHOT_TS_KEY)
-
-    return {"ok": True, "message": "Reset done: pnl=0, trades_done=0, trading unblocked"}
+    print("Startup done.")
 
 
 # =========================
